@@ -1,12 +1,17 @@
-
 import React, { useState, useEffect, useCallback } from 'react';
-import { Project, GenerationState } from './types';
+import { Project, GenerationState, CurrentState, RepoConfig } from './types';
 import { LivingLibrary } from './components/LivingLibrary';
 import { ProjectWorkspace } from './components/ProjectWorkspace';
 import { IdeaTicker } from './components/IdeaTicker';
 import { generateBlueprint } from './services/geminiService';
-import { ChevronLeftIcon } from './components/icons';
+import { ChevronLeftIcon, CodeBracketSquareIcon, DocumentTextIcon } from './components/icons';
+import { RepoPanel } from './components/RepoPanel';
+import { CombinedOutput } from './components/CombinedOutput';
 
+const GOLDEN_RULES = `THE GOLDEN RULES:
+NO PLACEHOLDERS, EVER: All features must be fully implemented. UI controls must be wired to state and logic. Data flows must be complete. Do not use // TODO, // Implement later, or leave empty function bodies. If you write a function, you must also write its complete implementation.
+EVERYTHING IS INTERACTIVE: The user must be able to click every button, enter text in every field, and see the application state change accordingly. All UI elements must be fully functional and wired up.
+ASSUME PRODUCTION CONTEXT: Write clean, readable, and maintainable code. Use appropriate data structures, robust state management, and ensure a polished, responsive user experience.`;
 
 const initialProjects: Project[] = [
     {
@@ -21,6 +26,13 @@ const initialProjects: Project[] = [
         ],
         blueprint: null,
         createdAt: new Date().toISOString(),
+        prompts: {
+            orchestrator: {
+                directive: GOLDEN_RULES,
+                injection: 'start_end',
+                includeState: true,
+            }
+        }
     },
     {
         id: 'proj-2',
@@ -34,6 +46,13 @@ const initialProjects: Project[] = [
         ],
         blueprint: null,
         createdAt: new Date().toISOString(),
+        prompts: {
+            orchestrator: {
+                directive: GOLDEN_RULES,
+                injection: 'start_end',
+                includeState: true,
+            }
+        }
     }
 ];
 
@@ -41,8 +60,23 @@ const initialProjects: Project[] = [
 const App: React.FC = () => {
     const [projects, setProjects] = useState<Project[]>(() => {
         const savedProjects = localStorage.getItem('ideacraft_projects');
-        return savedProjects ? JSON.parse(savedProjects) : initialProjects;
+        if (savedProjects) {
+            const parsedProjects = JSON.parse(savedProjects);
+            // Backwards compatibility for projects saved before prompts existed
+            return parsedProjects.map((p: Project) => ({
+                ...p,
+                prompts: p.prompts || {
+                    orchestrator: {
+                        directive: GOLDEN_RULES,
+                        injection: 'start_end',
+                        includeState: true,
+                    }
+                }
+            }));
+        }
+        return initialProjects;
     });
+
     const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
     const [generationState, setGenerationState] = useState<GenerationState>({
         status: 'idle',
@@ -50,6 +84,8 @@ const App: React.FC = () => {
         progress: 0,
         error: null,
     });
+    const [isRepoPanelOpen, setIsRepoPanelOpen] = useState(false);
+    const [isCombinedViewOpen, setIsCombinedViewOpen] = useState(false);
 
     useEffect(() => {
         localStorage.setItem('ideacraft_projects', JSON.stringify(projects));
@@ -74,6 +110,13 @@ const App: React.FC = () => {
             docs: [],
             blueprint: null,
             createdAt: new Date().toISOString(),
+            prompts: {
+                orchestrator: {
+                    directive: GOLDEN_RULES,
+                    injection: 'start_end',
+                    includeState: true,
+                }
+            }
         };
         setProjects(prev => [newProject, ...prev]);
         setActiveProjectId(newProject.id);
@@ -85,10 +128,61 @@ const App: React.FC = () => {
         );
     }, []);
 
+    const handleRepoScanComplete = (repoConfig: RepoConfig, currentState: CurrentState) => {
+        if (activeProjectId) {
+            const projectToUpdate = projects.find(p => p.id === activeProjectId);
+            if (projectToUpdate) {
+                handleUpdateProject({
+                    ...projectToUpdate,
+                    repo: repoConfig,
+                    current_state: currentState,
+                });
+            }
+        }
+        setIsRepoPanelOpen(false);
+    };
+
+    const composeFinalPrompt = (project: Project): string => {
+        let finalPrompt = project.brainDump;
+
+        const { orchestrator } = project.prompts!;
+        
+        if (orchestrator.includeState && project.current_state) {
+            const stateMarkdown = `--- CURRENT STATE ---\n${project.current_state.markdown.substring(0, 1500)}...\n--- END CURRENT STATE ---\n\n`;
+            finalPrompt = `${stateMarkdown}${finalPrompt}`;
+        }
+        
+        if (!orchestrator.directive) return finalPrompt;
+
+        switch (orchestrator.injection) {
+            case 'start':
+                return `${orchestrator.directive}\n\n${finalPrompt}`;
+            case 'start_end':
+                return `${orchestrator.directive}\n\n${finalPrompt}\n\n---\n\nREMINDER OF DIRECTIVE:\n${orchestrator.directive}`;
+            case 'start_mid_end': {
+                 const reminder = `\n\n---\nREMINDER: ADHERE TO DIRECTIVE\n---\n\n`;
+                 if (finalPrompt.length > 2500) {
+                     const mid = Math.floor(finalPrompt.length / 2);
+                     const breakPoint = finalPrompt.indexOf('\n', mid);
+                     const insertionPoint = breakPoint !== -1 ? breakPoint : mid;
+                     const part1 = finalPrompt.substring(0, insertionPoint);
+                     const part2 = finalPrompt.substring(insertionPoint);
+                     finalPrompt = `${part1}${reminder}${part2}`;
+                 }
+                 return `${orchestrator.directive}\n\n${finalPrompt}\n\n---\n\nREMINDER OF DIRECTIVE:\n${orchestrator.directive}`;
+            }
+            default:
+                return finalPrompt;
+        }
+    };
+
     const handleGenerateBlueprint = async (project: Project) => {
         setGenerationState({ status: 'generating', stage: 'Initializing...', progress: 5, error: null });
         try {
-            const finalBlueprint = await generateBlueprint(project, (update) => {
+            const composedBrainDump = composeFinalPrompt(project);
+            const projectForGeneration = { ...project, brainDump: composedBrainDump };
+
+            const finalBlueprint = await generateBlueprint(projectForGeneration, (update) => {
                 setGenerationState(prev => ({ ...prev, stage: update.stage, progress: update.progress }));
                 if(update.data?.sections) {
                     const partialBlueprint = { sections: update.data.sections };
@@ -110,10 +204,23 @@ const App: React.FC = () => {
         <div className="relative min-h-screen">
             <IdeaTicker projects={projects} />
             {activeProject && (
-                 <button onClick={handleBackToLibrary} className="fixed top-10 left-4 z-50 bg-brand-surface/50 p-2 rounded-full hover:bg-brand-surface transition-colors backdrop-blur-sm">
-                    <ChevronLeftIcon className="w-6 h-6" />
-                </button>
+                 <div className="fixed top-10 left-4 z-50 flex items-center gap-4">
+                    <button onClick={handleBackToLibrary} className="bg-brand-surface/50 p-2 rounded-full hover:bg-brand-surface transition-colors backdrop-blur-sm">
+                        <ChevronLeftIcon className="w-6 h-6" />
+                    </button>
+                 </div>
             )}
+             {activeProject && (
+                <div className="fixed top-10 right-4 z-50 flex items-center gap-2">
+                    <button onClick={() => setIsRepoPanelOpen(true)} className="bg-brand-surface/50 p-2 rounded-full hover:bg-brand-surface transition-colors backdrop-blur-sm" aria-label="Open Repository Scanner">
+                        <CodeBracketSquareIcon className="w-6 h-6" />
+                    </button>
+                    <button onClick={() => setIsCombinedViewOpen(true)} className="bg-brand-surface/50 p-2 rounded-full hover:bg-brand-surface transition-colors backdrop-blur-sm" aria-label="Open Combined View">
+                        <DocumentTextIcon className="w-6 h-6" />
+                    </button>
+                </div>
+            )}
+
             <main>
                 {activeProject ? (
                     <ProjectWorkspace 
@@ -122,6 +229,7 @@ const App: React.FC = () => {
                         onUpdateProject={handleUpdateProject}
                         onGenerateBlueprint={handleGenerateBlueprint}
                         generationState={generationState}
+                        onJumpToCombined={() => setIsCombinedViewOpen(true)}
                     />
                 ) : (
                     <LivingLibrary
@@ -131,6 +239,23 @@ const App: React.FC = () => {
                     />
                 )}
             </main>
+            {isRepoPanelOpen && activeProject && (
+                <RepoPanel 
+                    project={activeProject} 
+                    onClose={() => setIsRepoPanelOpen(false)}
+                    onScanComplete={handleRepoScanComplete}
+                />
+            )}
+             {isCombinedViewOpen && activeProject && (
+                <CombinedOutput
+                    project={activeProject}
+                    onClose={() => setIsCombinedViewOpen(false)}
+                    onViewSnapshot={() => {
+                        setIsCombinedViewOpen(false);
+                        setIsRepoPanelOpen(true);
+                    }}
+                />
+            )}
         </div>
     );
 };
